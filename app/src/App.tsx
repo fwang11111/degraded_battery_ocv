@@ -133,6 +133,15 @@ function fmtNum(x: number, digits = 4) {
   return Number.isFinite(x) ? x.toFixed(digits) : 'n/a'
 }
 
+function parseLooseNumberText(s: string): number | null {
+  const t = s.trim()
+  if (!t) return null
+  // Allow partial decimals like "0." while typing.
+  if (!/^-?(?:\d+(?:\.\d*)?|\.\d+)$/.test(t)) return null
+  const v = Number(t)
+  return Number.isFinite(v) ? v : null
+}
+
 function downloadTextFile(filename: string, text: string, mime = 'text/plain') {
   const blob = new Blob([text], { type: mime })
   const url = URL.createObjectURL(blob)
@@ -153,7 +162,7 @@ function buildTwoColCsv(rows: Array<[number, number]>, header: [string, string] 
 export default function App() {
   const apiBase = String((import.meta as any).env?.VITE_API_BASE ?? '').trim() || 'http://localhost:8000'
 
-  const [tab, setTab] = useState<TabKey>('degradation')
+  const [tab, setTab] = useState<TabKey>('pristine')
 
   const [profiles, setProfiles] = useState<PristineProfile[]>([])
   const [pristineId, setPristineId] = useState('')
@@ -177,6 +186,10 @@ export default function App() {
   const [lamPe, setLamPe] = useState(0)
   const [lamNe, setLamNe] = useState(0)
 
+  const [lliPctText, setLliPctText] = useState('0.0')
+  const [lamPePctText, setLamPePctText] = useState('0.0')
+  const [lamNePctText, setLamNePctText] = useState('0.0')
+
   const [curves, setCurves] = useState<CurvesResponse | null>(null)
   const [poolItems, setPoolItems] = useState<PoolItemSummary[]>([])
 
@@ -199,6 +212,23 @@ export default function App() {
   const [diagnosticsCurves, setDiagnosticsCurves] = useState<CurvesResponse | null>(null)
   const [diagnosticsCurvesLoading, setDiagnosticsCurvesLoading] = useState(false)
   const [saving, setSaving] = useState(false)
+
+  const [analysisResults, setAnalysisResults] = useState<Array<{ id: string; label: string; curves: CurvesResponse | null }>>([])
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+  const [selectedPoolIds, setSelectedPoolIds] = useState<Set<string>>(new Set())
+  const poolCurvesCache = useRef<Map<string, CurvesResponse | null>>(new Map())
+  const [analysisSelfNormalize, setAnalysisSelfNormalize] = useState(false)
+  const [analysisViewTab, setAnalysisViewTab] = useState<'voltage' | 'dq' | 'dqdv'>('voltage')
+  const [analysisDqDvWindowV, setAnalysisDqDvWindowV] = useState(0.005)
+  const [analysisDqDvWindowText, setAnalysisDqDvWindowText] = useState('0.005')
+
+  const [analysisTruncateV, setAnalysisTruncateV] = useState(false)
+  const [analysisVMaxText, setAnalysisVMaxText] = useState('4.0')
+  const [analysisVMinText, setAnalysisVMinText] = useState('3.5')
+
+  const [analysisPristineId, setAnalysisPristineId] = useState('')
+  const pristineCurvesCache = useRef<Map<string, CurvesResponse | null>>(new Map())
+  const [analysisPristineResults, setAnalysisPristineResults] = useState<Array<{ id: string; label: string; curves: CurvesResponse | null }>>([])
 
   const lastReqId = useRef(0)
 
@@ -606,9 +636,15 @@ export default function App() {
   function onSelectPoolItem(it: PoolItemSummary) {
     setError(null)
     setPristineId(it.pristine_id)
-    setLli(clamp(it.lli, 0, 0.6))
-    setLamPe(clamp(it.lam_pe, 0, 0.6))
-    setLamNe(clamp(it.lam_ne, 0, 0.6))
+    const lli0 = clamp(it.lli, 0, 0.6)
+    const pe0 = clamp(it.lam_pe, 0, 0.6)
+    const ne0 = clamp(it.lam_ne, 0, 0.6)
+    setLli(lli0)
+    setLamPe(pe0)
+    setLamNe(ne0)
+    setLliPctText((lli0 * 100).toFixed(1))
+    setLamPePctText((pe0 * 100).toFixed(1))
+    setLamNePctText((ne0 * 100).toFixed(1))
   }
 
   async function readFileAsText(file: File): Promise<string> {
@@ -803,6 +839,9 @@ export default function App() {
     setLli(0)
     setLamPe(0)
     setLamNe(0)
+    setLliPctText('0.0')
+    setLamPePctText('0.0')
+    setLamNePctText('0.0')
   }
 
   async function onLoadDiagnosticsSample() {
@@ -844,6 +883,116 @@ export default function App() {
     void ensureDiagnosticsPristineCurves()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, pristineId])
+
+  useEffect(() => {
+    if (tab !== 'analysis') return
+
+    // Identify items that are selected but not yet cached
+    const missingIds = poolItems
+      .filter((it) => selectedPoolIds.has(it.id) && !poolCurvesCache.current.has(it.id))
+      .map((it) => it.id)
+
+    // Helper to update results from cache
+    const updateResults = () => {
+      const results = poolItems
+        .filter((it) => selectedPoolIds.has(it.id))
+        .map((it) => ({
+          id: it.id,
+          label: it.label ?? it.id,
+          curves: poolCurvesCache.current.get(it.id) ?? null,
+        }))
+      setAnalysisResults(results)
+    }
+
+    if (missingIds.length === 0) {
+      updateResults()
+      return
+    }
+
+    const reqId = ++lastReqId.current
+    setAnalysisLoading(true)
+    setError(null)
+
+    async function fetchMissing() {
+      await Promise.all(
+        missingIds.map(async (id) => {
+          const item = poolItems.find((p) => p.id === id)
+          if (!item) return
+          try {
+            const c = await fetchCurves({ pristine_id: item.pristine_id, lli: item.lli, lam_pe: item.lam_pe, lam_ne: item.lam_ne })
+            poolCurvesCache.current.set(id, c)
+          } catch (e) {
+            console.error('Failed to load curve for', id, e)
+            poolCurvesCache.current.set(id, null)
+          }
+        }),
+      )
+
+      if (reqId !== lastReqId.current) return
+      setAnalysisLoading(false)
+      updateResults()
+    }
+
+    void fetchMissing()
+  }, [tab, poolItems, selectedPoolIds])
+
+  useEffect(() => {
+    if (tab !== 'analysis') return
+
+    if (!analysisPristineId) {
+      setAnalysisPristineResults([])
+      return
+    }
+
+    const missingIds = !pristineCurvesCache.current.has(analysisPristineId) ? [analysisPristineId] : []
+
+    const updateResults = () => {
+      const p = profiles.find((x) => x.id === analysisPristineId)
+      setAnalysisPristineResults([
+        {
+          id: analysisPristineId,
+          label: p?.name ?? analysisPristineId,
+          curves: pristineCurvesCache.current.get(analysisPristineId) ?? null,
+        },
+      ])
+    }
+
+    if (missingIds.length === 0) {
+      updateResults()
+      return
+    }
+
+    const reqId = ++lastReqId.current
+    setAnalysisLoading(true)
+    setError(null)
+
+    async function fetchMissing() {
+      await Promise.all(
+        missingIds.map(async (id) => {
+          try {
+            const c = await fetchCurves({ pristine_id: id, lli: 0, lam_pe: 0, lam_ne: 0 })
+            pristineCurvesCache.current.set(id, c)
+          } catch (e) {
+            console.error('Failed to load pristine curve for', id, e)
+            pristineCurvesCache.current.set(id, null)
+          }
+        }),
+      )
+
+      if (reqId !== lastReqId.current) return
+      setAnalysisLoading(false)
+      updateResults()
+    }
+
+    void fetchMissing()
+  }, [tab, analysisPristineId, profiles])
+
+  useEffect(() => {
+    if (tab !== 'analysis') return
+    if (analysisPristineId) return
+    if (profiles.length === 0) return
+    setAnalysisPristineId(profiles[0].id)
+  }, [tab, analysisPristineId, profiles])
 
   async function ensureDiagnosticsPristineCurves() {
     if (!pristineId) return
@@ -1184,6 +1333,948 @@ export default function App() {
     }
   }, [diagnosticsCurves, diagnosticsCurvesLoading, diagnosticsDegradedInfo, diagnosticsMeasured, diagnosticsResult])
 
+  const analysisVoltagePlot = useMemo(() => {
+    if (tab !== 'analysis') return null
+    if (analysisResults.length === 0 && analysisPristineResults.length === 0) return null
+
+    const traces: any[] = []
+    let validCount = 0
+
+    let yMin = Number.POSITIVE_INFINITY
+    let yMax = Number.NEGATIVE_INFINITY
+    const pushY = (y: unknown) => {
+      if (typeof y !== 'number') return
+      if (!Number.isFinite(y)) return
+      const yy = y
+      if (yy < yMin) yMin = yy
+      if (yy > yMax) yMax = yy
+    }
+
+    const defaultVisible = analysisResults.length > 40 ? 'legendonly' : true
+
+    const userVMax = analysisTruncateV ? parseLooseNumberText(analysisVMaxText) : null
+    const userVMin = analysisTruncateV ? parseLooseNumberText(analysisVMinText) : null
+    const truncateEnabled = Boolean(analysisTruncateV && userVMax != null && userVMin != null)
+
+    const getVBounds = (q: NumOrNull[], v: NumOrNull[], qMin: number, qMax: number) => {
+      let vLo = Number.POSITIVE_INFINITY
+      let vHi = Number.NEGATIVE_INFINITY
+      const n = Math.min(q.length, v.length)
+      for (let i = 0; i < n; i++) {
+        const qi = q[i]
+        const vi = v[i]
+        if (!isNum(qi) || !isNum(vi)) continue
+        if (qi < qMin || qi > qMax) continue
+        if (vi < vLo) vLo = vi
+        if (vi > vHi) vHi = vi
+      }
+      if (!Number.isFinite(vLo) || !Number.isFinite(vHi)) return null
+      return { vMin: vLo, vMax: vHi }
+    }
+
+    const truncParams = (q: NumOrNull[], v: NumOrNull[], qMin: number, qMax: number) => {
+      if (!truncateEnabled || userVMax == null || userVMin == null) return null
+      const bounds = getVBounds(q, v, qMin, qMax)
+      if (!bounds) return null
+
+      const vMaxEff = userVMax >= bounds.vMin && userVMax <= bounds.vMax ? userVMax : bounds.vMax
+      const vMinEff = userVMin >= bounds.vMin && userVMin <= bounds.vMax ? userVMin : bounds.vMin
+      if (!(vMaxEff > vMinEff)) return null
+
+      const q0 = interpXAtY(q, v, vMaxEff, qMin, qMax)
+      const q1 = interpXAtY(q, v, vMinEff, qMin, qMax)
+      if (!isNum(q0) || !isNum(q1) || !(q1 > q0)) return null
+
+      const capWin = q1 - q0
+      if (!(capWin > 0)) return null
+
+      const endX = analysisSelfNormalize ? 1 : capWin
+      const mapQ = (qi: number) => (analysisSelfNormalize ? (qi - q0) / capWin : qi - q0)
+      return { q0, q1, endX, mapQ }
+    }
+
+    for (const item of analysisPristineResults) {
+      if (!item.curves?.pristine?.cell) continue
+      const cell = item.curves.pristine.cell
+
+      const tp = truncParams(cell.x, cell.ocv, 0, 1)
+      if (tp) {
+        const n = Math.min(cell.x.length, cell.ocv.length)
+        const xPlot: number[] = []
+        const yPlot: number[] = []
+        for (let i = 0; i < n; i++) {
+          const q = cell.x[i]
+          const y = cell.ocv[i]
+          if (!isNum(q) || !isNum(y)) continue
+          if (q < tp.q0 || q > tp.q1) continue
+          const x = tp.mapQ(q)
+          if (x < 0 || x > 1) continue
+          xPlot.push(x)
+          yPlot.push(y)
+        }
+
+        const eps = 1e-10
+        const y0 = interpAt(cell.x, cell.ocv, tp.q0)
+        const y1 = interpAt(cell.x, cell.ocv, tp.q1)
+        if (y0 !== null) {
+          if (xPlot.length === 0 || xPlot[0] > eps) {
+            xPlot.unshift(0)
+            yPlot.unshift(y0)
+          } else {
+            xPlot[0] = 0
+            yPlot[0] = y0
+          }
+        }
+        if (y1 !== null) {
+          const lastIdx = xPlot.length - 1
+          if (lastIdx < 0 || xPlot[lastIdx] < tp.endX - eps) {
+            xPlot.push(tp.endX)
+            yPlot.push(y1)
+          } else {
+            xPlot[lastIdx] = tp.endX
+            yPlot[lastIdx] = y1
+          }
+        }
+
+        if (xPlot.length < 2) continue
+        for (const y of yPlot) pushY(y)
+
+        traces.push({
+          x: xPlot,
+          y: yPlot,
+          type: 'scatter',
+          mode: 'lines',
+          name: `Pristine: ${item.label}`,
+          line: { width: 3, dash: 'dash' },
+          opacity: 0.9,
+        })
+        continue
+      }
+
+      // Only include points visible in the x-range [0, 1] when computing y-range.
+      const n = Math.min(cell.x.length, cell.ocv.length)
+      for (let i = 0; i < n; i++) {
+        const x = cell.x[i]
+        const y = cell.ocv[i]
+        if (typeof x !== 'number' || !Number.isFinite(x)) continue
+        if (x < 0 || x > 1) continue
+        pushY(y)
+      }
+
+      traces.push({
+        x: cell.x,
+        y: cell.ocv,
+        type: 'scatter',
+        mode: 'lines',
+        name: `Pristine: ${item.label}`,
+        line: { width: 3, dash: 'dash' },
+        opacity: 0.9,
+      })
+    }
+
+    for (const item of analysisResults) {
+      if (!item.curves?.degraded?.valid) continue
+      const deg = item.curves.degraded
+      const xCellEoc = Number((deg.results as any).x_cell_eoc)
+      const xCellEod = Number((deg.results as any).x_cell_eod)
+      if (!Number.isFinite(xCellEoc) || !Number.isFinite(xCellEod)) continue
+
+      const cap = xCellEod - xCellEoc
+      if (!(cap > 0)) continue
+
+      validCount++
+
+      const xs = deg.cell.x
+      const ys = deg.cell.ocv
+      const n = Math.min(xs.length, ys.length)
+
+      const xPlot: number[] = []
+      const yPlot: number[] = []
+
+      const qMax = analysisSelfNormalize ? 1 : Math.min(1, cap)
+      if (!(qMax > 0)) continue
+
+      const qArr: Array<number | null> = []
+      for (let i = 0; i < n; i++) {
+        const x = xs[i]
+        if (!isNum(x)) {
+          qArr.push(null)
+          continue
+        }
+        if (analysisSelfNormalize) {
+          if (x < xCellEoc || x > xCellEod) {
+            qArr.push(null)
+            continue
+          }
+          qArr.push((x - xCellEoc) / cap)
+        } else {
+          qArr.push(x - xCellEoc)
+        }
+      }
+
+      const tp = truncParams(qArr, ys, 0, qMax)
+      if (tp) {
+        for (let i = 0; i < n; i++) {
+          const q = qArr[i]
+          const y = ys[i]
+          if (!isNum(q) || !isNum(y)) continue
+          if (q < tp.q0 || q > tp.q1) continue
+          const x = tp.mapQ(q)
+          if (x < 0 || x > 1) continue
+          xPlot.push(x)
+          yPlot.push(y)
+        }
+
+        const eps = 1e-10
+        const y0 = interpAt(qArr, ys, tp.q0)
+        const y1 = interpAt(qArr, ys, tp.q1)
+        if (y0 !== null) {
+          if (xPlot.length === 0 || xPlot[0] > eps) {
+            xPlot.unshift(0)
+            yPlot.unshift(y0)
+          } else {
+            xPlot[0] = 0
+            yPlot[0] = y0
+          }
+        }
+        if (y1 !== null) {
+          const lastIdx = xPlot.length - 1
+          if (lastIdx < 0 || xPlot[lastIdx] < tp.endX - eps) {
+            xPlot.push(tp.endX)
+            yPlot.push(y1)
+          } else {
+            xPlot[lastIdx] = tp.endX
+            yPlot[lastIdx] = y1
+          }
+        }
+
+        if (xPlot.length < 2) continue
+      } else {
+        if (analysisSelfNormalize) {
+          for (let i = 0; i < n; i++) {
+            const q = qArr[i]
+            const y = ys[i]
+            if (!isNum(q) || !isNum(y)) continue
+            if (q < 0 || q > 1) continue
+            xPlot.push(q)
+            yPlot.push(y)
+          }
+        } else {
+          const endX = qMax
+          for (let i = 0; i < n; i++) {
+            const q = qArr[i]
+            const y = ys[i]
+            if (!isNum(q) || !isNum(y)) continue
+            if (q < 0 || q > endX) continue
+            xPlot.push(q)
+            yPlot.push(y)
+          }
+
+          const eps = 1e-10
+          const y0 = interpAt(qArr, ys, 0)
+          const y1 = interpAt(qArr, ys, endX)
+          if (y0 !== null) {
+            if (xPlot.length === 0 || xPlot[0] > eps) {
+              xPlot.unshift(0)
+              yPlot.unshift(y0)
+            } else {
+              xPlot[0] = 0
+              yPlot[0] = y0
+            }
+          }
+          if (y1 !== null) {
+            const lastIdx = xPlot.length - 1
+            if (lastIdx < 0 || xPlot[lastIdx] < endX - eps) {
+              xPlot.push(endX)
+              yPlot.push(y1)
+            } else {
+              xPlot[lastIdx] = endX
+              yPlot[lastIdx] = y1
+            }
+          }
+
+          if (xPlot.length < 2) continue
+        }
+      }
+
+      for (const y of yPlot) pushY(y)
+
+      traces.push({
+        x: xPlot,
+        y: yPlot,
+        type: 'scatter',
+        mode: 'lines',
+        name: item.label,
+        line: { width: 2 },
+        opacity: 0.5,
+        visible: defaultVisible,
+      })
+    }
+
+    const shapes: any[] = [vLine(0, 'rgba(148,163,184,0.7)', 'dash'), vLine(1, 'rgba(148,163,184,0.7)', 'dash')]
+
+    const yRange = Number.isFinite(yMin) && Number.isFinite(yMax)
+      ? (() => {
+          const span = yMax - yMin
+          const safeSpan = span > 0 ? span : 0.05
+          const pad = Math.max(0.02, safeSpan * 0.05)
+          return [yMin - pad, yMax + pad] as [number, number]
+        })()
+      : undefined
+
+    return {
+      validCount,
+      data: traces,
+      layout: {
+        title: { text: 'Voltage Curve Comparison' },
+        xaxis: {
+          title: { text: analysisSelfNormalize ? 'Self-normalized capacity (0-1)' : 'Degraded capacity (pristine-normalized, offset)' },
+          range: [0, 1],
+          zeroline: false,
+          gridcolor: 'rgba(148,163,184,0.25)',
+        },
+        yaxis: {
+          title: { text: 'Voltage (V)' },
+          range: yRange,
+          zeroline: false,
+          gridcolor: 'rgba(148,163,184,0.25)',
+        },
+        margin: { l: 70, r: 20, t: 60, b: 60 },
+        legend: { x: 1.02, y: 1, xanchor: 'left' as const, yanchor: 'top' as const },
+        shapes,
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(255,255,255,1)',
+      },
+    }
+  }, [
+    analysisResults,
+    analysisPristineResults,
+    analysisSelfNormalize,
+    analysisTruncateV,
+    analysisVMaxText,
+    analysisVMinText,
+    tab,
+    poolItems.length,
+  ])
+
+  const analysisDqPlot = useMemo(() => {
+    if (tab !== 'analysis') return null
+
+    const pri = analysisPristineResults.length === 1 ? analysisPristineResults[0] : null
+    const priCell = pri?.curves?.pristine?.cell
+    if (!priCell) return { missingPristine: true as const, data: [], layout: { title: { text: 'dQ vs V' } } }
+
+    if (analysisResults.length === 0) return null
+
+    const priX = priCell.x
+    const priV = priCell.ocv
+
+    const userVMax = analysisTruncateV ? parseLooseNumberText(analysisVMaxText) : null
+    const userVMin = analysisTruncateV ? parseLooseNumberText(analysisVMinText) : null
+    const truncateEnabled = Boolean(analysisTruncateV && userVMax != null && userVMin != null)
+
+    const getVBounds = (q: NumOrNull[], v: NumOrNull[], qMin: number, qMax: number) => {
+      let vLo = Number.POSITIVE_INFINITY
+      let vHi = Number.NEGATIVE_INFINITY
+      const n = Math.min(q.length, v.length)
+      for (let i = 0; i < n; i++) {
+        const qi = q[i]
+        const vi = v[i]
+        if (!isNum(qi) || !isNum(vi)) continue
+        if (qi < qMin || qi > qMax) continue
+        if (vi < vLo) vLo = vi
+        if (vi > vHi) vHi = vi
+      }
+      if (!Number.isFinite(vLo) || !Number.isFinite(vHi)) return null
+      return { vMin: vLo, vMax: vHi }
+    }
+
+    const truncForCurve = (q: NumOrNull[], v: NumOrNull[], qMin: number, qMax: number) => {
+      if (!truncateEnabled || userVMax == null || userVMin == null) return null
+      const bounds = getVBounds(q, v, qMin, qMax)
+      if (!bounds) return null
+      const vMaxEff = userVMax >= bounds.vMin && userVMax <= bounds.vMax ? userVMax : bounds.vMax
+      const vMinEff = userVMin >= bounds.vMin && userVMin <= bounds.vMax ? userVMin : bounds.vMin
+      if (!(vMaxEff > vMinEff)) return null
+      const q0 = interpXAtY(q, v, vMaxEff, qMin, qMax)
+      const q1 = interpXAtY(q, v, vMinEff, qMin, qMax)
+      if (!isNum(q0) || !isNum(q1) || !(q1 > q0)) return null
+      return { q0, q1, capWin: q1 - q0 }
+    }
+
+    const priTr = truncForCurve(priX, priV, 0, 1)
+    const priMapQ = (q: number) => {
+      if (!priTr) return q
+      if (analysisSelfNormalize) return (q - priTr.q0) / priTr.capWin
+      return q - priTr.q0
+    }
+
+    const traces: any[] = []
+    let xMin = Number.POSITIVE_INFINITY
+    let xMax = Number.NEGATIVE_INFINITY
+    let yMin = Number.POSITIVE_INFINITY
+    let yMax = Number.NEGATIVE_INFINITY
+
+    const pushStats = (dq: unknown, v: unknown) => {
+      if (typeof dq === 'number' && Number.isFinite(dq)) {
+        if (dq < xMin) xMin = dq
+        if (dq > xMax) xMax = dq
+      }
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        if (v < yMin) yMin = v
+        if (v > yMax) yMax = v
+      }
+    }
+
+    // Reference pristine baseline at dQ=0.
+    {
+      const n = Math.min(priX.length, priV.length)
+      const x0: Array<number | null> = []
+      const y0: Array<number | null> = []
+      for (let i = 0; i < n; i++) {
+        const x = priX[i]
+        const v = priV[i]
+        if (!isNum(x) || x < 0 || x > 1 || !isNum(v)) {
+          if (x0.length > 0 && x0[x0.length - 1] !== null) {
+            x0.push(null)
+            y0.push(null)
+          }
+          continue
+        }
+        x0.push(0)
+        y0.push(v)
+        pushStats(0, v)
+      }
+
+      traces.push({
+        x: x0,
+        y: y0,
+        type: 'scatter',
+        mode: 'lines',
+        name: `Pristine dQ=0: ${pri?.label ?? pri?.id ?? ''}`,
+        line: { width: 3, dash: 'dash' },
+        opacity: 0.9,
+        hoverinfo: 'skip',
+      })
+    }
+
+    const defaultVisible = analysisResults.length > 40 ? 'legendonly' : true
+    const eps = 1e-10
+
+    for (const item of analysisResults) {
+      if (!item.curves?.degraded?.valid) continue
+      const deg = item.curves.degraded
+      const xCellEoc = Number((deg.results as any).x_cell_eoc)
+      const xCellEod = Number((deg.results as any).x_cell_eod)
+      if (!Number.isFinite(xCellEoc) || !Number.isFinite(xCellEod)) continue
+
+      const cap = xCellEod - xCellEoc
+      if (!(cap > 0)) continue
+
+      const xs = deg.cell.x
+      const vs = deg.cell.ocv
+      const n = Math.min(xs.length, vs.length)
+
+      const xPlot: Array<number | null> = []
+      const yPlot: Array<number | null> = []
+
+      const qMaxDeg = analysisSelfNormalize ? 1 : Math.min(1, cap)
+      if (!(qMaxDeg > 0)) continue
+
+      const qDegArr: Array<number | null> = []
+      for (let i = 0; i < n; i++) {
+        const x = xs[i]
+        if (!isNum(x)) {
+          qDegArr.push(null)
+          continue
+        }
+        if (analysisSelfNormalize) {
+          if (x < xCellEoc - eps || x > xCellEod + eps) {
+            qDegArr.push(null)
+            continue
+          }
+          qDegArr.push((x - xCellEoc) / cap)
+        } else {
+          qDegArr.push(x - xCellEoc)
+        }
+      }
+
+      const degTr = truncForCurve(qDegArr, vs, 0, qMaxDeg)
+      const degMapQ = (q: number) => {
+        if (!degTr) return q
+        if (analysisSelfNormalize) return (q - degTr.q0) / degTr.capWin
+        return q - degTr.q0
+      }
+
+      let hadPoint = false
+      for (let i = 0; i < n; i++) {
+        const v = vs[i]
+        const q = qDegArr[i]
+        if (!isNum(q) || !isNum(v)) {
+          if (hadPoint && xPlot[xPlot.length - 1] !== null) {
+            xPlot.push(null)
+            yPlot.push(null)
+          }
+          continue
+        }
+
+        if (q < -eps || q > qMaxDeg + eps) {
+          if (hadPoint && xPlot[xPlot.length - 1] !== null) {
+            xPlot.push(null)
+            yPlot.push(null)
+          }
+          continue
+        }
+
+        if (degTr && (q < degTr.q0 - eps || q > degTr.q1 + eps)) {
+          if (hadPoint && xPlot[xPlot.length - 1] !== null) {
+            xPlot.push(null)
+            yPlot.push(null)
+          }
+          continue
+        }
+
+        const qPri = interpXAtY(priX, priV, v, 0, 1)
+        if (!isNum(qPri)) {
+          if (hadPoint && xPlot[xPlot.length - 1] !== null) {
+            xPlot.push(null)
+            yPlot.push(null)
+          }
+          continue
+        }
+
+        if (priTr && (qPri < priTr.q0 - eps || qPri > priTr.q1 + eps)) {
+          if (hadPoint && xPlot[xPlot.length - 1] !== null) {
+            xPlot.push(null)
+            yPlot.push(null)
+          }
+          continue
+        }
+
+        const dq = degMapQ(clamp(q, 0, qMaxDeg)) - priMapQ(clamp(qPri, 0, 1))
+        xPlot.push(dq)
+        yPlot.push(v)
+        pushStats(dq, v)
+        hadPoint = true
+      }
+
+      if (xPlot.length < 2) continue
+
+      traces.push({
+        x: xPlot,
+        y: yPlot,
+        type: 'scatter',
+        mode: 'lines',
+        name: item.label,
+        line: { width: 2 },
+        opacity: 0.6,
+        visible: defaultVisible,
+      })
+    }
+
+    if (traces.length === 0) return null
+
+    const xRange = Number.isFinite(xMin) && Number.isFinite(xMax)
+      ? (() => {
+          const span = xMax - xMin
+          const safeSpan = span > 0 ? span : 0.1
+          const pad = Math.max(0.02, safeSpan * 0.08)
+          return [xMin - pad, xMax + pad] as [number, number]
+        })()
+      : undefined
+
+    const yRange = Number.isFinite(yMin) && Number.isFinite(yMax)
+      ? (() => {
+          const span = yMax - yMin
+          const safeSpan = span > 0 ? span : 0.05
+          const pad = Math.max(0.02, safeSpan * 0.05)
+          return [yMin - pad, yMax + pad] as [number, number]
+        })()
+      : undefined
+
+    const shapes: any[] = [
+      {
+        type: 'line',
+        xref: 'x',
+        yref: 'paper',
+        x0: 0,
+        x1: 0,
+        y0: 0,
+        y1: 1,
+        line: { color: 'rgba(148,163,184,0.7)', width: 1, dash: 'dash' },
+      },
+    ]
+
+    return {
+      missingPristine: false as const,
+      data: traces,
+      layout: {
+        title: { text: 'dQ vs V' },
+        xaxis: {
+          title: { text: analysisSelfNormalize ? 'dQ (self-normalized)' : 'dQ (pristine-normalized, offset)' },
+          range: xRange,
+          zeroline: false,
+          gridcolor: 'rgba(148,163,184,0.25)',
+        },
+        yaxis: {
+          title: { text: 'Voltage (V)' },
+          range: yRange,
+          zeroline: false,
+          gridcolor: 'rgba(148,163,184,0.25)',
+        },
+        margin: { l: 70, r: 20, t: 60, b: 60 },
+        legend: { x: 1.02, y: 1, xanchor: 'left' as const, yanchor: 'top' as const },
+        shapes,
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(255,255,255,1)',
+      },
+    }
+  }, [
+    analysisPristineResults,
+    analysisResults,
+    analysisSelfNormalize,
+    analysisDqDvWindowV,
+    analysisDqDvWindowText,
+    analysisTruncateV,
+    analysisVMaxText,
+    analysisVMinText,
+    tab,
+  ])
+
+  const analysisOriginalVRange = useMemo(() => {
+    if (tab !== 'analysis') return null
+
+    let vMin = Number.POSITIVE_INFINITY
+    let vMax = Number.NEGATIVE_INFINITY
+
+    const pushV = (v: unknown) => {
+      if (typeof v !== 'number' || !Number.isFinite(v)) return
+      if (v < vMin) vMin = v
+      if (v > vMax) vMax = v
+    }
+
+    const pushCurve = (q: NumOrNull[], v: NumOrNull[], qMin: number, qMax: number) => {
+      const n = Math.min(q.length, v.length)
+      for (let i = 0; i < n; i++) {
+        const qi = q[i]
+        const vi = v[i]
+        if (!isNum(qi) || !isNum(vi)) continue
+        if (qi < qMin || qi > qMax) continue
+        pushV(vi)
+      }
+    }
+
+    for (const item of analysisPristineResults) {
+      const cell = item.curves?.pristine?.cell
+      if (!cell) continue
+      pushCurve(cell.x, cell.ocv, 0, 1)
+    }
+
+    for (const item of analysisResults) {
+      const deg = item.curves?.degraded
+      if (!deg || !deg.valid) continue
+      const xCellEoc = Number((deg.results as any).x_cell_eoc)
+      const xCellEod = Number((deg.results as any).x_cell_eod)
+      if (!Number.isFinite(xCellEoc) || !Number.isFinite(xCellEod)) continue
+      const cap = xCellEod - xCellEoc
+      if (!(cap > 0)) continue
+
+      const qMax = analysisSelfNormalize ? 1 : Math.min(1, cap)
+      if (!(qMax > 0)) continue
+
+      const xs = deg.cell.x
+      const vs = deg.cell.ocv
+      const n = Math.min(xs.length, vs.length)
+      const qArr: Array<number | null> = []
+      for (let i = 0; i < n; i++) {
+        const x = xs[i]
+        if (!isNum(x)) {
+          qArr.push(null)
+          continue
+        }
+        if (analysisSelfNormalize) {
+          if (x < xCellEoc || x > xCellEod) {
+            qArr.push(null)
+            continue
+          }
+          qArr.push((x - xCellEoc) / cap)
+        } else {
+          qArr.push(x - xCellEoc)
+        }
+      }
+      pushCurve(qArr, vs, 0, qMax)
+    }
+
+    if (!Number.isFinite(vMin) || !Number.isFinite(vMax) || !(vMax > vMin)) return null
+    return { vMin, vMax }
+  }, [tab, analysisPristineResults, analysisResults, analysisSelfNormalize])
+
+  useEffect(() => {
+    if (tab !== 'analysis') return
+    if (!analysisOriginalVRange) return
+
+    const vmax = parseLooseNumberText(analysisVMaxText)
+    if (vmax != null) {
+      const clamped = clamp(vmax, analysisOriginalVRange.vMin, analysisOriginalVRange.vMax)
+      if (clamped !== vmax) setAnalysisVMaxText(clamped.toFixed(3))
+    }
+
+    const vmin = parseLooseNumberText(analysisVMinText)
+    if (vmin != null) {
+      const clamped = clamp(vmin, analysisOriginalVRange.vMin, analysisOriginalVRange.vMax)
+      if (clamped !== vmin) setAnalysisVMinText(clamped.toFixed(3))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, analysisOriginalVRange, analysisVMaxText, analysisVMinText])
+
+  const analysisDqdvPlot = useMemo(() => {
+    if (tab !== 'analysis') return null
+
+    if (analysisResults.length === 0 && analysisPristineResults.length === 0) return null
+
+    const pri = analysisPristineResults.length === 1 ? analysisPristineResults[0] : null
+    const priCell = pri?.curves?.pristine?.cell ?? null
+
+    const traces: any[] = []
+    // x = V, y = dQ/dV
+    let xMin = Number.POSITIVE_INFINITY
+    let xMax = Number.NEGATIVE_INFINITY
+    let yMin = Number.POSITIVE_INFINITY
+    let yMax = Number.NEGATIVE_INFINITY
+
+    const pushStats = (dqdv: unknown, v: unknown) => {
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        if (v < xMin) xMin = v
+        if (v > xMax) xMax = v
+      }
+      if (typeof dqdv === 'number' && Number.isFinite(dqdv)) {
+        if (dqdv < yMin) yMin = dqdv
+        if (dqdv > yMax) yMax = dqdv
+      }
+    }
+
+    const eps = 1e-10
+
+    const dvIn = parseLooseNumberText(analysisDqDvWindowText) ?? analysisDqDvWindowV
+    const dv = Math.max(1e-6, Number(dvIn) || 0.001)
+
+    // Compute dQ/dV by:
+    // 1) averaging Q within a fixed voltage window (bin) of width dv on a uniform V grid
+    // 2) differencing adjacent averaged Q values: dQ / dv
+    function computeDqdvFromVGrid(
+      q: NumOrNull[],
+      v: NumOrNull[],
+      qMin: number,
+      qMax: number,
+      vStart: number,
+      vEnd: number,
+    ): { x: Array<number | null>; y: Array<number | null> } {
+      if (!(vEnd > vStart) || !(dv > 0)) return { x: [], y: [] }
+
+      const half = dv / 2
+      const centers: number[] = []
+      for (let vc = vStart + half; vc <= vEnd - half + 1e-12; vc += dv) centers.push(vc)
+      if (centers.length < 3) return { x: [], y: [] }
+
+      const qAvg: Array<number | null> = []
+      for (const vc of centers) {
+        const q1 = interpXAtY(q, v, vc - half, qMin, qMax)
+        const q2 = interpXAtY(q, v, vc + half, qMin, qMax)
+        if (isNum(q1) && isNum(q2)) qAvg.push((q1 + q2) / 2)
+        else qAvg.push(null)
+      }
+
+      const xOut: Array<number | null> = []
+      const yOut: Array<number | null> = []
+      for (let i = 0; i < qAvg.length - 1; i++) {
+        const a = qAvg[i]
+        const b = qAvg[i + 1]
+        const vMid = centers[i] + dv / 2
+        if (isNum(a) && isNum(b)) {
+          xOut.push(vMid)
+          yOut.push(Math.abs((b - a) / dv))
+        } else {
+          if (xOut.length > 0 && xOut[xOut.length - 1] !== null) {
+            xOut.push(null)
+            yOut.push(null)
+          }
+        }
+      }
+
+      return { x: xOut, y: yOut }
+    }
+
+    const userVMax = analysisTruncateV ? parseLooseNumberText(analysisVMaxText) : null
+    const userVMin = analysisTruncateV ? parseLooseNumberText(analysisVMinText) : null
+    const truncateEnabled = Boolean(analysisTruncateV && userVMax != null && userVMin != null)
+
+    const getVBounds = (q: NumOrNull[], v: NumOrNull[], qMin: number, qMax: number) => {
+      let vLo = Number.POSITIVE_INFINITY
+      let vHi = Number.NEGATIVE_INFINITY
+      const n = Math.min(q.length, v.length)
+      for (let i = 0; i < n; i++) {
+        const qi = q[i]
+        const vi = v[i]
+        if (!isNum(qi) || !isNum(vi)) continue
+        if (qi < qMin || qi > qMax) continue
+        if (vi < vLo) vLo = vi
+        if (vi > vHi) vHi = vi
+      }
+      if (!Number.isFinite(vLo) || !Number.isFinite(vHi)) return null
+      return { vMin: vLo, vMax: vHi }
+    }
+
+    const buildLine = (name: string, q: NumOrNull[], v: NumOrNull[], qMin: number, qMax: number, style: any) => {
+      const bounds = getVBounds(q, v, qMin, qMax)
+      if (!bounds) return
+
+      let vMaxEff = bounds.vMax
+      let vMinEff = bounds.vMin
+      if (truncateEnabled && userVMax != null && userVMin != null) {
+        vMaxEff = userVMax >= bounds.vMin && userVMax <= bounds.vMax ? userVMax : bounds.vMax
+        vMinEff = userVMin >= bounds.vMin && userVMin <= bounds.vMax ? userVMin : bounds.vMin
+        if (!(vMaxEff > vMinEff)) {
+          vMaxEff = bounds.vMax
+          vMinEff = bounds.vMin
+        }
+      }
+
+      let qArr = q
+      let qMaxUse = qMax
+      if (truncateEnabled && userVMax != null && userVMin != null) {
+        const q0 = interpXAtY(q, v, vMaxEff, qMin, qMax)
+        const q1 = interpXAtY(q, v, vMinEff, qMin, qMax)
+        if (isNum(q0) && isNum(q1) && q1 > q0) {
+          const capWin = q1 - q0
+          qArr = q.map((qi) => (isNum(qi) ? (analysisSelfNormalize ? (qi - q0) / capWin : qi - q0) : null))
+          qMaxUse = analysisSelfNormalize ? 1 : capWin
+        }
+      }
+
+      if ((vMaxEff - vMinEff) / dv > 5000) return
+      const line = computeDqdvFromVGrid(qArr, v, 0, qMaxUse, vMinEff, vMaxEff)
+      if (line.x.length < 2) return
+
+      for (let i = 0; i < line.x.length; i++) pushStats(line.y[i], line.x[i])
+      traces.push({
+        x: line.x,
+        y: line.y,
+        type: 'scatter',
+        mode: 'lines',
+        name,
+        ...style,
+      })
+    }
+
+    if (priCell) {
+      buildLine(`Pristine: ${pri?.label ?? pri?.id ?? ''}`, priCell.x, priCell.ocv, 0, 1, { line: { width: 3, dash: 'dash' }, opacity: 0.9 })
+    }
+
+    const defaultVisible = analysisResults.length > 40 ? 'legendonly' : true
+
+    for (const item of analysisResults) {
+      if (!item.curves?.degraded?.valid) continue
+      const deg = item.curves.degraded
+      const xCellEoc = Number((deg.results as any).x_cell_eoc)
+      const xCellEod = Number((deg.results as any).x_cell_eod)
+      if (!Number.isFinite(xCellEoc) || !Number.isFinite(xCellEod)) continue
+
+      const cap = xCellEod - xCellEoc
+      if (!(cap > 0)) continue
+
+      const xs = deg.cell.x
+      const vs = deg.cell.ocv
+      const qMax = analysisSelfNormalize ? 1 : Math.min(1, cap)
+      if (!(qMax > 0)) continue
+
+      const qDeg: Array<number | null> = []
+      const n = Math.min(xs.length, vs.length)
+      for (let i = 0; i < n; i++) {
+        const x = xs[i]
+        if (!isNum(x)) {
+          qDeg.push(null)
+          continue
+        }
+        if (analysisSelfNormalize) {
+          if (x < xCellEoc - eps || x > xCellEod + eps) {
+            qDeg.push(null)
+            continue
+          }
+          qDeg.push((x - xCellEoc) / cap)
+        } else {
+          qDeg.push(x - xCellEoc)
+        }
+      }
+
+      buildLine(item.label, qDeg, vs, 0, qMax, { line: { width: 2 }, opacity: 0.6, visible: defaultVisible })
+    }
+
+    if (traces.length === 0) return null
+
+    const xRange = Number.isFinite(xMin) && Number.isFinite(xMax)
+      ? (() => {
+          const span = xMax - xMin
+          const safeSpan = span > 0 ? span : 0.2
+          const pad = Math.max(0.02, safeSpan * 0.05)
+          return [xMin - pad, xMax + pad] as [number, number]
+        })()
+      : undefined
+
+    const yRange = Number.isFinite(yMin) && Number.isFinite(yMax)
+      ? (() => {
+          const span = yMax - yMin
+          const safeSpan = span > 0 ? span : 0.5
+          const pad = Math.max(0.05, safeSpan * 0.08)
+          return [yMin - pad, yMax + pad] as [number, number]
+        })()
+      : undefined
+
+    const shapes: any[] = [
+      {
+        type: 'line',
+        xref: 'paper',
+        yref: 'y',
+        x0: 0,
+        x1: 1,
+        y0: 0,
+        y1: 0,
+        line: { color: 'rgba(148,163,184,0.7)', width: 1, dash: 'dash' },
+      },
+    ]
+
+    return {
+      data: traces,
+      layout: {
+        title: { text: 'dQ/dV vs V' },
+        xaxis: {
+          title: { text: 'Voltage (V)' },
+          range: xRange,
+          zeroline: false,
+          gridcolor: 'rgba(148,163,184,0.25)',
+        },
+        yaxis: {
+          title: { text: analysisSelfNormalize ? 'dQ/dV (self-normalized)' : 'dQ/dV (pristine-normalized, offset)' },
+          range: yRange,
+          zeroline: false,
+          gridcolor: 'rgba(148,163,184,0.25)',
+        },
+        margin: { l: 70, r: 20, t: 60, b: 60 },
+        legend: { x: 1.02, y: 1, xanchor: 'left' as const, yanchor: 'top' as const },
+        shapes,
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(255,255,255,1)',
+      },
+    }
+  }, [
+    analysisPristineResults,
+    analysisResults,
+    analysisSelfNormalize,
+    analysisTruncateV,
+    analysisVMaxText,
+    analysisVMinText,
+    tab,
+  ])
+
   return (
     <div className="shell">
       <div className="topbar">
@@ -1205,7 +2296,7 @@ export default function App() {
         </button>
       </div>
 
-      <div className="content">
+      <div className="content" style={tab === 'analysis' ? { gridTemplateColumns: '400px 1fr' } : undefined}>
         {tab === 'pristine' ? (
           <>
             <aside className="sidebar">
@@ -1400,15 +2491,41 @@ export default function App() {
                     <div className="sliderVal">{fmtPct(lli)}</div>
                     <input
                       className="paramInput"
-                      type="number"
-                      min={0}
-                      max={60}
-                      step={0.1}
-                      value={Number.isFinite(lli) ? (lli * 100).toFixed(1) : '0.0'}
-                      onChange={(e) => setLli(clamp(Number(e.target.value) / 100, 0, 0.6))}
+                      type="text"
+                      inputMode="decimal"
+                      value={lliPctText}
+                      onChange={(e) => {
+                        const raw = e.target.value
+                        setLliPctText(raw)
+                        const pct = parseLooseNumberText(raw)
+                        if (pct === null) return
+                        setLli(clamp(pct / 100, 0, 0.6))
+                      }}
+                      onBlur={() => {
+                        const pct = Number(lliPctText)
+                        if (!Number.isFinite(pct)) {
+                          setLliPctText((lli * 100).toFixed(1))
+                          return
+                        }
+                        const next = clamp(pct / 100, 0, 0.6)
+                        setLli(next)
+                        setLliPctText((next * 100).toFixed(1))
+                      }}
                     />
                   </div>
-                  <input className="slider" type="range" min={0} max={0.6} step={0.001} value={lli} onChange={(e) => setLli(clamp(Number(e.target.value), 0, 0.6))} />
+                  <input
+                    className="slider"
+                    type="range"
+                    min={0}
+                    max={0.6}
+                    step={0.001}
+                    value={lli}
+                    onChange={(e) => {
+                      const next = clamp(Number(e.target.value), 0, 0.6)
+                      setLli(next)
+                      setLliPctText((next * 100).toFixed(1))
+                    }}
+                  />
                 </div>
 
                 <div className="sliderRow">
@@ -1417,15 +2534,41 @@ export default function App() {
                     <div className="sliderVal">{fmtPct(lamPe)}</div>
                     <input
                       className="paramInput"
-                      type="number"
-                      min={0}
-                      max={60}
-                      step={0.1}
-                      value={Number.isFinite(lamPe) ? (lamPe * 100).toFixed(1) : '0.0'}
-                      onChange={(e) => setLamPe(clamp(Number(e.target.value) / 100, 0, 0.6))}
+                      type="text"
+                      inputMode="decimal"
+                      value={lamPePctText}
+                      onChange={(e) => {
+                        const raw = e.target.value
+                        setLamPePctText(raw)
+                        const pct = parseLooseNumberText(raw)
+                        if (pct === null) return
+                        setLamPe(clamp(pct / 100, 0, 0.6))
+                      }}
+                      onBlur={() => {
+                        const pct = Number(lamPePctText)
+                        if (!Number.isFinite(pct)) {
+                          setLamPePctText((lamPe * 100).toFixed(1))
+                          return
+                        }
+                        const next = clamp(pct / 100, 0, 0.6)
+                        setLamPe(next)
+                        setLamPePctText((next * 100).toFixed(1))
+                      }}
                     />
                   </div>
-                  <input className="slider" type="range" min={0} max={0.6} step={0.001} value={lamPe} onChange={(e) => setLamPe(clamp(Number(e.target.value), 0, 0.6))} />
+                  <input
+                    className="slider"
+                    type="range"
+                    min={0}
+                    max={0.6}
+                    step={0.001}
+                    value={lamPe}
+                    onChange={(e) => {
+                      const next = clamp(Number(e.target.value), 0, 0.6)
+                      setLamPe(next)
+                      setLamPePctText((next * 100).toFixed(1))
+                    }}
+                  />
                 </div>
 
                 <div className="sliderRow">
@@ -1434,15 +2577,41 @@ export default function App() {
                     <div className="sliderVal">{fmtPct(lamNe)}</div>
                     <input
                       className="paramInput"
-                      type="number"
-                      min={0}
-                      max={60}
-                      step={0.1}
-                      value={Number.isFinite(lamNe) ? (lamNe * 100).toFixed(1) : '0.0'}
-                      onChange={(e) => setLamNe(clamp(Number(e.target.value) / 100, 0, 0.6))}
+                      type="text"
+                      inputMode="decimal"
+                      value={lamNePctText}
+                      onChange={(e) => {
+                        const raw = e.target.value
+                        setLamNePctText(raw)
+                        const pct = parseLooseNumberText(raw)
+                        if (pct === null) return
+                        setLamNe(clamp(pct / 100, 0, 0.6))
+                      }}
+                      onBlur={() => {
+                        const pct = Number(lamNePctText)
+                        if (!Number.isFinite(pct)) {
+                          setLamNePctText((lamNe * 100).toFixed(1))
+                          return
+                        }
+                        const next = clamp(pct / 100, 0, 0.6)
+                        setLamNe(next)
+                        setLamNePctText((next * 100).toFixed(1))
+                      }}
                     />
                   </div>
-                  <input className="slider" type="range" min={0} max={0.6} step={0.001} value={lamNe} onChange={(e) => setLamNe(clamp(Number(e.target.value), 0, 0.6))} />
+                  <input
+                    className="slider"
+                    type="range"
+                    min={0}
+                    max={0.6}
+                    step={0.001}
+                    value={lamNe}
+                    onChange={(e) => {
+                      const next = clamp(Number(e.target.value), 0, 0.6)
+                      setLamNe(next)
+                      setLamNePctText((next * 100).toFixed(1))
+                    }}
+                  />
                 </div>
 
                 <div className="btnRow">
@@ -1696,21 +2865,262 @@ export default function App() {
           </>
         ) : (
           <>
-            <aside className="sidebar">
+            <aside className="sidebar" style={{ width: '400px', maxWidth: '40vw' }}>
               <div className="panel">
-                <div className="panelTitle">Analysis</div>
-                <div className="miniStatSub">Not implemented yet.</div>
+                <div className="panelTitle">Pristine Cell</div>
+                <select className="select" value={analysisPristineId} onChange={(e) => setAnalysisPristineId(e.target.value)}>
+                  {profiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
               </div>
+
+              <div className="panel">
+                <div className="panelTitle">Analysis Selection</div>
+
+                {analysisViewTab === 'dqdv' ? (
+                  <div className="miniStat" style={{ marginTop: 0, marginBottom: '10px' }}>
+                    <div className="miniStatKey">Smooth window (V)</div>
+                    <input
+                      className="paramInput"
+                      type="text"
+                      inputMode="decimal"
+                      value={analysisDqDvWindowText}
+                      onChange={(e) => {
+                        const raw = e.target.value
+                        setAnalysisDqDvWindowText(raw)
+                        const v = parseLooseNumberText(raw)
+                        if (v === null) return
+                        setAnalysisDqDvWindowV(clamp(v, 0.0001, 0.02))
+                      }}
+                      onBlur={() => {
+                        const v = Number(analysisDqDvWindowText)
+                        if (!Number.isFinite(v)) {
+                          setAnalysisDqDvWindowText(String(analysisDqDvWindowV))
+                          return
+                        }
+                        const next = clamp(v, 0.0001, 0.02)
+                        setAnalysisDqDvWindowV(next)
+                        setAnalysisDqDvWindowText(String(next))
+                      }}
+                    />
+                    <div className="miniStatSub">Average Q in a uniform V grid, then dQ/dV.</div>
+                  </div>
+                ) : null}
+
+                <div className="miniStat" style={{ marginBottom: '10px' }}>
+                  <div className="miniStatKey">Selected / Total</div>
+                  <div className="miniStatVal">
+                    {selectedPoolIds.size} / {poolItems.length}
+                  </div>
+                </div>
+
+                <div className="btnRow" style={{ marginTop: 0, marginBottom: '10px', gridTemplateColumns: '1fr 1fr' }}>
+                  <button className="btn" type="button" onClick={() => setSelectedPoolIds(new Set(poolItems.map((i) => i.id)))}>
+                    Select All
+                  </button>
+                  <button className="btn" type="button" onClick={() => setSelectedPoolIds(new Set())}>
+                    Clear
+                  </button>
+                </div>
+
+                <div className="poolList" style={{ maxHeight: '260px', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: '8px', background: '#fff' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                    <thead>
+                      <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--line)' }}>
+                        <th style={{ padding: '4px' }}></th>
+                        <th style={{ padding: '4px' }}>Label</th>
+                        <th style={{ padding: '4px' }}>Pristine</th>
+                        <th style={{ padding: '4px' }}>LLI</th>
+                        <th style={{ padding: '4px' }}>PE</th>
+                        <th style={{ padding: '4px' }}>NE</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {poolItems.map((it) => {
+                        const isSel = selectedPoolIds.has(it.id)
+                        return (
+                          <tr key={it.id} style={{ borderBottom: '1px solid var(--line)', background: isSel ? 'var(--blue-weak)' : 'transparent' }}>
+                            <td style={{ padding: '4px' }}>
+                              <input
+                                type="checkbox"
+                                checked={isSel}
+                                onChange={(e) => {
+                                  const next = new Set(selectedPoolIds)
+                                  if (e.target.checked) next.add(it.id)
+                                  else next.delete(it.id)
+                                  setSelectedPoolIds(next)
+                                }}
+                              />
+                            </td>
+                            <td style={{ padding: '4px', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={it.label ?? it.id}>
+                              {it.label ?? it.id}
+                            </td>
+                            <td style={{ padding: '4px', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={it.pristine_id}>
+                              {it.pristine_id}
+                            </td>
+                            <td style={{ padding: '4px' }}>{fmtPct(it.lli)}</td>
+                            <td style={{ padding: '4px' }}>{fmtPct(it.lam_pe)}</td>
+                            <td style={{ padding: '4px' }}>{fmtPct(it.lam_ne)}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="miniStat" style={{ marginTop: '10px' }}>
+                  <div className="miniStatKey">Truncate voltage window</div>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 6 }}>
+                    <button
+                      className={analysisTruncateV ? 'toggleBtn toggleBtnOn' : 'toggleBtn'}
+                      type="button"
+                      onClick={() => setAnalysisTruncateV((v) => !v)}
+                      aria-pressed={analysisTruncateV}
+                    >
+                      <span className="toggleKnob" />
+                      <span className="toggleLabel">{analysisTruncateV ? 'On' : 'Off'}</span>
+                    </button>
+                    {analysisOriginalVRange ? (
+                      <div className="miniStatSub" style={{ marginTop: 0 }}>
+                        Original: {analysisOriginalVRange.vMin.toFixed(3)} - {analysisOriginalVRange.vMax.toFixed(3)} V
+                      </div>
+                    ) : (
+                      <div className="miniStatSub" style={{ marginTop: 0 }}>Original: n/a</div>
+                    )}
+                  </div>
+
+                  {analysisTruncateV ? (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                      <div>
+                        <div className="miniStatKey">V max</div>
+                        <input
+                          className="paramInput"
+                          type="text"
+                          inputMode="decimal"
+                          value={analysisVMaxText}
+                          onChange={(e) => {
+                            const raw = e.target.value
+                            setAnalysisVMaxText(raw)
+                            if (!analysisOriginalVRange) return
+                            const v = parseLooseNumberText(raw)
+                            if (v === null) return
+                            const c = clamp(v, analysisOriginalVRange.vMin, analysisOriginalVRange.vMax)
+                            if (c !== v) setAnalysisVMaxText(c.toFixed(3))
+                          }}
+                          onBlur={() => {
+                            if (!analysisOriginalVRange) return
+                            const v = Number(analysisVMaxText)
+                            if (!Number.isFinite(v)) {
+                              setAnalysisVMaxText(analysisOriginalVRange.vMax.toFixed(3))
+                              return
+                            }
+                            setAnalysisVMaxText(clamp(v, analysisOriginalVRange.vMin, analysisOriginalVRange.vMax).toFixed(3))
+                          }}
+                        />
+                      </div>
+                      <div>
+                        <div className="miniStatKey">V min</div>
+                        <input
+                          className="paramInput"
+                          type="text"
+                          inputMode="decimal"
+                          value={analysisVMinText}
+                          onChange={(e) => {
+                            const raw = e.target.value
+                            setAnalysisVMinText(raw)
+                            if (!analysisOriginalVRange) return
+                            const v = parseLooseNumberText(raw)
+                            if (v === null) return
+                            const c = clamp(v, analysisOriginalVRange.vMin, analysisOriginalVRange.vMax)
+                            if (c !== v) setAnalysisVMinText(c.toFixed(3))
+                          }}
+                          onBlur={() => {
+                            if (!analysisOriginalVRange) return
+                            const v = Number(analysisVMinText)
+                            if (!Number.isFinite(v)) {
+                              setAnalysisVMinText(analysisOriginalVRange.vMin.toFixed(3))
+                              return
+                            }
+                            setAnalysisVMinText(clamp(v, analysisOriginalVRange.vMin, analysisOriginalVRange.vMax).toFixed(3))
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+
               <div className="apiHint">API: {apiBase}</div>
             </aside>
             <section className="main">
-              <div className="mainHeader">
-                <div className="mainTitle">Analysis</div>
-                <div className="mainStatus">Ready</div>
+              <div style={{ display: 'flex', gap: 14, padding: '0 0 10px', borderBottom: '1px solid var(--line)', alignItems: 'baseline' }}>
+                <button className={analysisViewTab === 'voltage' ? 'tab tabActive' : 'tab'} type="button" onClick={() => setAnalysisViewTab('voltage')}>
+                  Voltage Curve Comparison
+                </button>
+                <button className={analysisViewTab === 'dq' ? 'tab tabActive' : 'tab'} type="button" onClick={() => setAnalysisViewTab('dq')}>
+                  dQ vs V
+                </button>
+                <button className={analysisViewTab === 'dqdv' ? 'tab tabActive' : 'tab'} type="button" onClick={() => setAnalysisViewTab('dqdv')}>
+                  dQ/dV vs V
+                </button>
+                <div className="mainStatus" style={{ marginLeft: 'auto' }}>
+                  {analysisLoading ? 'Loading...' : 'Ready'}
+                </div>
+              </div>
+
+              <div style={{ padding: '10px 0 10px' }}>
+                <button
+                  className={analysisSelfNormalize ? 'toggleBtn toggleBtnOn' : 'toggleBtn'}
+                  type="button"
+                  onClick={() => setAnalysisSelfNormalize((v) => !v)}
+                  disabled={analysisResults.length === 0 && analysisPristineResults.length === 0}
+                  aria-pressed={analysisSelfNormalize}
+                >
+                  <span className="toggleKnob" />
+                  <span className="toggleLabel">Self normalization</span>
+                </button>
               </div>
               {error ? <div className="error">{error}</div> : null}
               <div className="plotWrap">
-                <div className="plotPlaceholder">Analysis tab placeholder.</div>
+                {(() => {
+                  const pick =
+                    analysisViewTab === 'voltage'
+                      ? analysisVoltagePlot
+                      : analysisViewTab === 'dq'
+                        ? analysisDqPlot
+                        : analysisDqdvPlot
+                  if (pick && (pick as any).data?.length > 0) {
+                    const plotKey = `analysis-${analysisViewTab}-${analysisSelfNormalize ? 1 : 0}-${analysisViewTab === 'dqdv' ? analysisDqDvWindowText : ''}-${analysisTruncateV ? 1 : 0}-${analysisVMaxText}-${analysisVMinText}`
+                    return (
+                      <Plot
+                        key={plotKey}
+                        data={(pick as any).data}
+                        layout={(pick as any).layout}
+                        style={{ width: '100%', height: '100%' }}
+                        config={{ responsive: true }}
+                      />
+                    )
+                  }
+
+                  if (analysisViewTab === 'dq' && (pick as any)?.missingPristine) {
+                    return <div className="plotPlaceholder">Select a pristine profile to compute dQ.</div>
+                  }
+
+                  return (
+                    <div className="plotPlaceholder">
+                      {analysisLoading
+                        ? 'Loading curves...'
+                        : selectedPoolIds.size === 0 && !analysisPristineId
+                          ? 'Select one or more cells to plot.'
+                        : (analysisViewTab === 'dq' || analysisViewTab === 'dqdv') && selectedPoolIds.size === 0
+                            ? 'Select one or more degraded cells to compute dQ.'
+                            : 'No valid curves to display.'}
+                    </div>
+                  )
+                })()}
               </div>
             </section>
           </>
@@ -1720,4 +3130,29 @@ export default function App() {
       <div className="footerHint">API base: {apiBase}</div>
     </div>
   )
+}
+
+function interpXAtY(x: NumOrNull[], y: NumOrNull[], y0: number, xMin = -Infinity, xMax = Infinity): number | null {
+  const n = Math.min(x.length, y.length)
+  if (n < 2) return null
+
+  for (let i = 0; i < n - 1; i++) {
+    const x1 = x[i]
+    const x2 = x[i + 1]
+    const y1 = y[i]
+    const y2 = y[i + 1]
+
+    if (!isNum(x1) || !isNum(x2) || !isNum(y1) || !isNum(y2)) continue
+    if (x1 < xMin || x1 > xMax || x2 < xMin || x2 > xMax) continue
+
+    const lo = Math.min(y1, y2)
+    const hi = Math.max(y1, y2)
+    if (y0 < lo || y0 > hi) continue
+    if (y2 === y1) continue
+
+    const t = (y0 - y1) / (y2 - y1)
+    return x1 + t * (x2 - x1)
+  }
+
+  return null
 }
